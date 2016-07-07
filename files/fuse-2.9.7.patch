@@ -1,0 +1,117 @@
+diff --git a/lib/fuse.c b/lib/fuse.c
+index fa0a814..9f296b5 100644
+--- a/lib/fuse.c
++++ b/lib/fuse.c
+@@ -2798,6 +2798,7 @@ static void fuse_lib_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
+ 						       attr->st_size);
+ 		}
+ #ifdef HAVE_UTIMENSAT
++#ifndef __ANDROID__
+ 		if (!err && f->utime_omit_ok &&
+ 		    (valid & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME))) {
+ 			struct timespec tv[2];
+@@ -2819,6 +2820,7 @@ static void fuse_lib_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
+ 
+ 			err = fuse_fs_utimens(f->fs, path, tv);
+ 		} else
++#endif // __ANDROID__
+ #endif
+ 		if (!err &&
+ 		    (valid & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME)) ==
+@@ -4591,7 +4593,11 @@ void fuse_stop_cleanup_thread(struct fuse *f)
+ {
+ 	if (lru_enabled(f)) {
+ 		pthread_mutex_lock(&f->lock);
+-		pthread_cancel(f->prune_thread);
++		#if defined(__ANDROID__)
++					pthread_kill(f->prune_thread, SIGUSR1);
++		#else
++					pthread_cancel(f->prune_thread);
++		#endif
+ 		pthread_mutex_unlock(&f->lock);
+ 		pthread_join(f->prune_thread, NULL);
+ 	}
+diff --git a/lib/fuse_i.h b/lib/fuse_i.h
+index fa37156..0fcd68b 100644
+--- a/lib/fuse_i.h
++++ b/lib/fuse_i.h
+@@ -9,6 +9,8 @@
+ #include "fuse.h"
+ #include "fuse_lowlevel.h"
+ 
++#include <pthread.h>
++
+ struct fuse_chan;
+ struct fuse_ll;
+ 
+diff --git a/lib/fuse_loop_mt.c b/lib/fuse_loop_mt.c
+index 82e3001..902cdec 100644
+--- a/lib/fuse_loop_mt.c
++++ b/lib/fuse_loop_mt.c
+@@ -63,11 +63,31 @@ static void list_del_worker(struct fuse_worker *w)
+ 
+ static int fuse_loop_start_thread(struct fuse_mt *mt);
+ 
++void thread_exit_handler(int sig)
++{
++	pthread_exit(0);
++}
++
+ static void *fuse_do_work(void *data)
+ {
+ 	struct fuse_worker *w = (struct fuse_worker *) data;
+ 	struct fuse_mt *mt = w->mt;
+ 
++#if defined(__ANDROID__)
++	struct sigaction actions;
++	memset(&actions, 0, sizeof(actions));
++	sigemptyset(&actions.sa_mask);
++	actions.sa_flags = 0;
++	actions.sa_handler = thread_exit_handler;
++	sigaction(SIGUSR1, &actions, NULL);
++
++	sigset_t setusr1;
++	sigemptyset(&setusr1);
++	sigaddset(&setusr1, SIGUSR1);
++	pthread_sigmask(SIG_BLOCK, &setusr1, NULL);
++#endif
++
++
+ 	while (!fuse_session_exited(mt->se)) {
+ 		int isforget = 0;
+ 		struct fuse_chan *ch = mt->prevch;
+@@ -77,9 +97,17 @@ static void *fuse_do_work(void *data)
+ 		};
+ 		int res;
+ 
+-		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
++		#if defined(__ANDROID__)
++				pthread_sigmask(SIG_UNBLOCK, &setusr1, NULL);
++		#else
++				pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
++		#endif
+ 		res = fuse_session_receive_buf(mt->se, &fbuf, &ch);
+-		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
++		#if defined(__ANDROID__)
++				pthread_sigmask(SIG_BLOCK, &setusr1, NULL);
++		#else
++				pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
++		#endif
+ 		if (res == -EINTR)
+ 			continue;
+ 		if (res <= 0) {
+@@ -243,7 +271,13 @@ int fuse_session_loop_mt(struct fuse_session *se)
+ 
+ 		pthread_mutex_lock(&mt.lock);
+ 		for (w = mt.main.next; w != &mt.main; w = w->next)
+-			pthread_cancel(w->thread_id);
++		{
++			#if defined(__ANDROID__)
++						pthread_kill(w->thread_id, SIGUSR1);
++			#else
++						pthread_cancel(w->thread_id);
++			#endif
++		}
+ 		mt.exit = 1;
+ 		pthread_mutex_unlock(&mt.lock);
+ 

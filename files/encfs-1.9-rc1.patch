@@ -1,0 +1,200 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ecffbaa..005cdf3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,8 +11,7 @@ set (ENCFS_NAME "Encrypted Filesystem")
+ 
+ option(IWYU "Build with IWYU analyais." OFF)
+ 
+-set (CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH}
+-  "${CMAKE_SOURCE_DIR}/cmake")
++set (CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
+ 
+ option (BUILD_SHARED_LIBS "build shared libraries" OFF)
+ option (USE_INTERNAL_TINYXML "use build-in TinyXML2" ON)
+@@ -44,6 +43,8 @@ if (APPLE)
+    endif()
+ endif()
+ 
++find_package (Threads REQUIRED)
++
+ # Check for FUSE.
+ find_package (FUSE REQUIRED)
+ include_directories (${FUSE_INCLUDE_DIR})
+@@ -148,7 +149,7 @@ add_library(encfs ${SOURCE_FILES})
+ set_target_properties(encfs PROPERTIES
+   VERSION ${ENCFS_VERSION}
+   SOVERSION ${ENCFS_SOVERSION})
+-target_link_libraries(encfs
++list(APPEND LIBRARIES encfs
+   ${FUSE_LIBRARIES}
+   ${OPENSSL_LIBRARIES}
+   ${TINYXML_LIBRARIES}
+@@ -171,19 +172,19 @@ endif()
+ set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+ 
+ add_executable (encfs-bin encfs/main.cpp)
+-target_link_libraries (encfs-bin encfs)
++target_link_libraries (encfs-bin ${LIBRARIES})
+ set_target_properties (encfs-bin PROPERTIES OUTPUT_NAME "encfs")
+ install (TARGETS encfs-bin DESTINATION bin)
+ 
+ add_executable (encfsctl encfs/encfsctl.cpp)
+-target_link_libraries (encfsctl encfs)
++target_link_libraries (encfsctl ${LIBRARIES})
+ install (TARGETS encfsctl DESTINATION bin)
+ 
+ add_executable (makekey encfs/makeKey.cpp)
+-target_link_libraries (makekey encfs)
++target_link_libraries (makekey ${LIBRARIES})
+ 
+ add_executable (checkops encfs/test.cpp)
+-target_link_libraries (checkops encfs)
++target_link_libraries (checkops ${LIBRARIES})
+ 
+ install (FILES encfs/encfssh DESTINATION bin)
+ 
+diff --git a/cmake/FindFUSE.cmake b/cmake/FindFUSE.cmake
+index b1e8861..80276f6 100644
+--- a/cmake/FindFUSE.cmake
++++ b/cmake/FindFUSE.cmake
+@@ -1,5 +1,9 @@
+ # Find the FUSE includes and library
+ #
++#  input:
++#  FUSE_USE_STATIC_LIBS
++#  Use CMAKE_FIND_ROOT_PATH for ROOT specification
++#
+ #  FUSE_INCLUDE_DIR - where to find fuse.h, etc.
+ #  FUSE_LIBRARIES   - List of libraries when using FUSE.
+ #  FUSE_FOUND       - True if FUSE lib is found.
+@@ -9,21 +13,22 @@ if (FUSE_INCLUDE_DIR)
+         SET (FUSE_FIND_QUIETLY TRUE)
+ endif (FUSE_INCLUDE_DIR)
+ 
+-if (APPLE)
+-    set (FUSE_NAMES libosxfuse.dylib fuse)
+-    set (FUSE_SUFFIXES osxfuse fuse)
+-else (APPLE)
+-    set (FUSE_NAMES fuse)
+-    set (FUSE_SUFFIXES fuse)
+-endif (APPLE)
++set( _fuse_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
++if(WIN32)
++	set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
++else()
++	set(CMAKE_FIND_LIBRARY_SUFFIXES .a )
++endif()
+ 
+ # find includes
+-find_path (FUSE_INCLUDE_DIR fuse.h
+-        PATHS /opt /opt/local /usr/pkg
+-        PATH_SUFFIXES ${FUSE_SUFFIXES})
++find_path (FUSE_INCLUDE_DIR fuse.h)
+ 
+ # find lib
+-find_library (FUSE_LIBRARIES NAMES ${FUSE_NAMES})
++find_library (FUSE_LIBRARIES NAMES fuse fuse3 PATH_SUFFIXES lib)
++if (FUSE_LIBRARIES_NOTFOUND AND NOT FUSE_USE_STATIC_LIBS)
++	set(CMAKE_FIND_LIBRARY_SUFFIXES ${_fuse_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES})
++	find_library (FUSE_LIBRARIES fuse PATH_SUFFIXES lib)
++endif()
+ 
+ include ("FindPackageHandleStandardArgs")
+ find_package_handle_standard_args ("FUSE" DEFAULT_MSG
+diff --git a/encfs/encfs.cpp b/encfs/encfs.cpp
+index c97a545..9aa9fea 100644
+--- a/encfs/encfs.cpp
++++ b/encfs/encfs.cpp
+@@ -33,6 +33,7 @@
+ #include <utime.h>
+ #ifdef linux
+ #include <sys/fsuid.h>
++#include <sys/time.h>
+ #endif
+ 
+ #if defined(HAVE_SYS_XATTR_H)
+@@ -495,6 +496,30 @@ int encfs_utime(const char *path, struct utimbuf *buf) {
+   return withCipherPath("utime", path, bind(_do_utime, _1, _2, buf));
+ }
+ 
++inline int timespec_from_timeval(struct timespec& ts, const struct timeval& tv)
++{
++	ts.tv_sec = tv.tv_sec;
++	ts.tv_nsec = tv.tv_usec*1000;
++	return 0;
++}
++
++static int futimesat(int fd, const char* path, const timeval tv[2], int flags) {
++  timespec ts[2];
++  if (tv && (!timespec_from_timeval(ts[0], tv[0]) || !timespec_from_timeval(ts[1], tv[1]))) {
++    errno = EINVAL;
++    return -1;
++  }
++  return utimensat(fd, path, tv ? ts : nullptr, flags);
++}
++
++int utimes(const char* path, const timeval tv[2]) {
++  return futimesat(AT_FDCWD, path, tv, 0);
++}
++
++int lutimes(const char* path, const timeval tv[2]) {
++  return futimesat(AT_FDCWD, path, tv, AT_SYMLINK_NOFOLLOW);
++}
++
+ int _do_utimens(EncFS_Context *, const string &cyName,
+                 const struct timespec ts[2]) {
+   struct timeval tv[2];
+diff --git a/encfs/encfsctl.cpp b/encfs/encfsctl.cpp
+index 4964d23..ab6bd1a 100644
+--- a/encfs/encfsctl.cpp
++++ b/encfs/encfsctl.cpp
+@@ -345,7 +345,7 @@ static int cmd_ls(int argc, char **argv) {
+         fnode->getAttr(&stbuf);
+ 
+         struct tm stm;
+-        localtime_r(&stbuf.st_mtime, &stm);
++        localtime_r((const time_t*)&stbuf.st_mtime, &stm);
+         stm.tm_year += 1900;
+         // TODO: when I add "%s" to the end and name.c_str(), I get a
+         // seg fault from within strlen.  Why ???
+diff --git a/internal/easylogging++.h b/internal/easylogging++.h
+index f9a67fe..74a5160 100755
+--- a/internal/easylogging++.h
++++ b/internal/easylogging++.h
+@@ -86,6 +86,35 @@
+ #endif  // ((ELPP_OS_LINUX || ELPP_OS_MAC || ELPP_OS_FREEBSD || ELPP_OS_SOLARIS) && (!ELPP_OS_WINDOWS))
+ // Android
+ #if defined(__ANDROID__)
++#ifndef FP_INFINITE
++/* Symbolic constants to classify floating point numbers. */
++#define        FP_INFINITE     0x01
++#define        FP_NAN          0x02
++#define        FP_NORMAL       0x04
++#define        FP_SUBNORMAL    0x08
++#define        FP_ZERO         0x10
++#define        fpclassify(x) \
++    ((sizeof (x) == sizeof (float)) ? __fpclassifyf(x) \
++    : (sizeof (x) == sizeof (double)) ? __fpclassifyd(x) \
++    : __fpclassifyl(x))
++
++#define        isfinite(x)                                     \
++    ((sizeof (x) == sizeof (float)) ? __isfinitef(x)   \
++    : (sizeof (x) == sizeof (double)) ? __isfinite(x)  \
++    : __isfinitel(x))
++#define        isinf(x)                                        \
++    ((sizeof (x) == sizeof (float)) ? __isinff(x)      \
++    : (sizeof (x) == sizeof (double)) ? isinf(x)       \
++    : __isinfl(x))
++#define        isnan(x)                                        \
++    ((sizeof (x) == sizeof (float)) ? __isnanf(x)      \
++    : (sizeof (x) == sizeof (double)) ? isnan(x)       \
++    : __isnanl(x))
++#define        isnormal(x)                                     \
++    ((sizeof (x) == sizeof (float)) ? __isnormalf(x)   \
++    : (sizeof (x) == sizeof (double)) ? __isnormal(x)  \
++    : __isnormall(x))
++#endif
+ #   define ELPP_OS_ANDROID 1
+ #endif  // defined(__ANDROID__)
+ // Evaluating Cygwin as *nix OS
